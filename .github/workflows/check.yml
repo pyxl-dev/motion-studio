@@ -1,0 +1,18 @@
+name: check
+on: [push, pull_request]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Server and CLI round trip
+        run: |
+          DATA_DIR=$RUNNER_TEMP/data bun server.ts &
+          for i in $(seq 1 20); do curl -sf http://127.0.0.1:5317/ >/dev/null && break; sleep 0.5; done
+          curl -sf http://127.0.0.1:5317/ | grep -q "Motion Studio"
+          echo '{"name":"CI","width":1920,"height":1080,"fps":30,"duration":2,"background":"#000000","layers":[]}' > m.json
+          bun tools/motion.ts push m.json ci-check
+          bun tools/motion.ts pull ci-check | grep -q '"rev": 1'
+          bun tools/motion.ts list | grep -q ci-check
