@@ -1,0 +1,723 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Studio runtime</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@300..800&family=Inter:wght@300..800&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400..700&family=Space+Grotesk:wght@300..700&display=swap">
+<!--
+  Script layers run here, in an iframe sandboxed with allow-scripts only: an opaque
+  origin with no access to the app, cookies or API. The editor sends layers and
+  frame requests by postMessage and gets ImageBitmaps back.
+-->
+<script type="module">
+let THREE = null; // three.js r170, WebGL: `three` layers
+let GPU = null; // { THREE, TSL, addons }, three.js r187 WebGPU + TSL: `three-gpu` layers
+let scale = 1;
+const layers = new Map();
+const post = (m, transfer) => parent.postMessage(m, '*', transfer);
+
+// ---------- Helpers given to scripts ----------
+
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, k) => a + (b - a) * k;
+const map = (v, a, b, c, d) => c + ((v - a) / (b - a)) * (d - c);
+const smooth = (a, b, x) => { const k = clamp((x - a) / (b - a)); return k * k * (3 - 2 * k); };
+const fract = (x) => x - Math.floor(x);
+function rand(seed = 1) {
+  let a = seed >>> 0 || 1;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+// Improved Perlin noise, 3D, range about -1..1.
+const perm = new Uint8Array(512);
+{ const r = rand(1337), p = [...Array(256).keys()]; for (let i = 255; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [p[i], p[j]] = [p[j], p[i]]; } for (let i = 0; i < 512; i++) perm[i] = p[i & 255]; }
+const fade = (t) => t * t * t * (t * (t * 6 - 15) + 10);
+const grad = (h, x, y, z) => { const u = h < 8 ? x : y, v = h < 4 ? y : h === 12 || h === 14 ? x : z; return ((h & 1) ? -u : u) + ((h & 2) ? -v : v); };
+function noise(x, y = 0, z = 0) {
+  const X = Math.floor(x) & 255, Y = Math.floor(y) & 255, Z = Math.floor(z) & 255;
+  x -= Math.floor(x); y -= Math.floor(y); z -= Math.floor(z);
+  const u = fade(x), v = fade(y), w = fade(z);
+  const A = perm[X] + Y, AA = perm[A] + Z, AB = perm[A + 1] + Z, B = perm[X + 1] + Y, BA = perm[B] + Z, BB = perm[B + 1] + Z;
+  return lerp(
+    lerp(lerp(grad(perm[AA] & 15, x, y, z), grad(perm[BA] & 15, x - 1, y, z), u), lerp(grad(perm[AB] & 15, x, y - 1, z), grad(perm[BB] & 15, x - 1, y - 1, z), u), v),
+    lerp(lerp(grad(perm[AA + 1] & 15, x, y, z - 1), grad(perm[BA + 1] & 15, x - 1, y, z - 1), u), lerp(grad(perm[AB + 1] & 15, x, y - 1, z - 1), grad(perm[BB + 1] & 15, x - 1, y - 1, z - 1), u), v),
+    w,
+  );
+}
+const c1 = 1.70158, c3 = c1 + 1;
+const ease = {
+  linear: (x) => x,
+  inOutSine: (x) => -(Math.cos(Math.PI * x) - 1) / 2,
+  outCubic: (x) => 1 - (1 - x) ** 3,
+  inOutCubic: (x) => (x < 0.5 ? 4 * x * x * x : 1 - (-2 * x + 2) ** 3 / 2),
+  outQuart: (x) => 1 - (1 - x) ** 4,
+  outExpo: (x) => (x >= 1 ? 1 : 1 - 2 ** (-10 * x)),
+  inOutExpo: (x) => (x <= 0 ? 0 : x >= 1 ? 1 : x < 0.5 ? 2 ** (20 * x - 10) / 2 : (2 - 2 ** (-20 * x + 10)) / 2),
+  outBack: (x) => 1 + c3 * (x - 1) ** 3 + c1 * (x - 1) ** 2,
+  outElastic: (x) => (x <= 0 ? 0 : x >= 1 ? 1 : 2 ** (-10 * x) * Math.sin((x * 10 - 0.75) * ((2 * Math.PI) / 3)) + 1),
+};
+// Progress of t through [a, b], eased: the workhorse of time-based animation.
+const range = (t, a, b, fn = ease.inOutCubic) => fn(clamp((t - a) / (b - a)));
+
+// Soft studio lighting for PBR materials: a dim room with a few bright panels, prefiltered.
+function studioEnv(s, { intensity = 1, warm = '#ffd9b0', cool = '#b8c8ff' } = {}) {
+  const THREE = s.THREE;
+  const env = new THREE.Scene();
+  const room = new THREE.Mesh(new THREE.BoxGeometry(20, 12, 20), new THREE.MeshBasicMaterial({ color: 0x0b0c10, side: THREE.BackSide }));
+  env.add(room);
+  const panel = (color, k, pos, rot, w, h) => {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color: new THREE.Color(color).multiplyScalar(k * intensity), side: THREE.DoubleSide }));
+    m.position.set(...pos); m.rotation.set(...rot); env.add(m);
+  };
+  panel('#ffffff', 6, [0, 5.9, 0], [Math.PI / 2, 0, 0], 8, 3);
+  panel(warm, 4, [-9.9, 1, 2], [0, Math.PI / 2, 0], 6, 4);
+  panel(cool, 4, [9.9, 1, -2], [0, -Math.PI / 2, 0], 6, 4);
+  panel('#ffffff', 2, [0, 0, -9.9], [0, 0, 0], 12, 2);
+  const pm = new THREE.PMREMGenerator(s.renderer);
+  const tex = pm.fromScene(env, 0.035).texture;
+  pm.dispose();
+  s.scene.environment = tex;
+  return tex;
+}
+
+// ---------- Post-processing for three layers (opt-in with s.post()) ----------
+// Ambient occlusion and depth of field written against Three.js core: the addons import
+// 'three' by name and cannot load in this sandbox. Chain: scene -> multisampled HDR target
+// with depth -> AO -> AO applied (blurred, depth-aware) -> DOF gather + tone mapping -> canvas.
+// Colours stay premultiplied all along, so the layer keeps its transparent background and
+// AO on a ShadowMaterial ground darkens the composition below it.
+
+const FSQ_VERT = 'varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }';
+
+const AO_FRAG = `
+uniform sampler2D tDepth; uniform mat4 invProj; uniform vec2 res; uniform float radius, bias, focal;
+varying vec2 vUv;
+vec3 viewPos(vec2 uv) { vec4 v = invProj * vec4(uv * 2.0 - 1.0, texture2D(tDepth, uv).x * 2.0 - 1.0, 1.0); return v.xyz / v.w; }
+void main() {
+  if (texture2D(tDepth, vUv).x >= 1.0) { gl_FragColor = vec4(1.0); return; }
+  vec2 px = 1.0 / res;
+  vec3 p = viewPos(vUv);
+  // normal from the smaller of the forward and backward differences: no halo on silhouettes
+  vec3 pr = viewPos(vUv + vec2(px.x, 0.0)), pl = viewPos(vUv - vec2(px.x, 0.0));
+  vec3 pu = viewPos(vUv + vec2(0.0, px.y)), pd = viewPos(vUv - vec2(0.0, px.y));
+  vec3 dx = abs(pr.z - p.z) < abs(p.z - pl.z) ? pr - p : p - pl;
+  vec3 dy = abs(pu.z - p.z) < abs(p.z - pd.z) ? pu - p : p - pd;
+  vec3 n = normalize(cross(dx, dy));
+  float rPx = min(radius * focal * 0.5 * res.y / -p.z, 0.05 * res.y);
+  float ang = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) * 6.2831853;
+  float occ = 0.0;
+  for (int i = 0; i < 16; i++) {
+    float f = (float(i) + 0.5) / 16.0, a = ang + float(i) * 2.39996323;
+    vec3 q = viewPos(vUv + vec2(cos(a), sin(a)) * sqrt(f) * rPx * px) - p;
+    float l = length(q);
+    occ += max(0.0, dot(n, q) / (l + 1e-4) - bias) * (1.0 - smoothstep(radius, radius * 2.0, l));
+  }
+  gl_FragColor = vec4(vec3(clamp(1.0 - occ / 16.0 * 1.6, 0.0, 1.0)), 1.0);
+}`;
+
+const APPLY_FRAG = `
+#include <packing>
+uniform sampler2D tColor, tAO, tDepth; uniform vec2 res; uniform float intensity, ground, near, far;
+varying vec2 vUv;
+float viewDist(vec2 uv) { return -perspectiveDepthToViewZ(texture2D(tDepth, uv).x, near, far); }
+void main() {
+  vec4 c = texture2D(tColor, vUv);
+  float z = viewDist(vUv), sum = 0.0, wsum = 0.0;
+  for (int x = -2; x <= 2; x++) for (int y = -2; y <= 2; y++) {
+    vec2 uv = vUv + vec2(float(x), float(y)) * 1.5 / res;
+    float w = exp(-abs(viewDist(uv) - z) / (0.03 * z + 1e-3));
+    sum += texture2D(tAO, uv).r * w; wsum += w;
+  }
+  float ao = pow(clamp(sum / max(wsum, 1e-4), 0.0, 1.0), intensity);
+  // opaque surfaces get darker; transparent ones (shadow-catcher ground) gain black coverage
+  gl_FragColor = vec4(c.rgb * ao, c.a + (1.0 - c.a) * (1.0 - ao) * ground);
+}`;
+
+const DOF_FRAG = `
+#include <packing>
+uniform sampler2D tColor, tDepth; uniform vec2 res; uniform float focus, aperture, maxBlur, pxScale, near, far;
+varying vec2 vUv;
+float viewDist(vec2 uv) { return -perspectiveDepthToViewZ(texture2D(tDepth, uv).x, near, far); }
+float coc(float z) { return clamp(abs(z - focus) / z * aperture, 0.0, maxBlur) * pxScale; }
+void main() {
+  vec4 col = texture2D(tColor, vUv);
+  if (aperture > 0.0 && maxBlur > 0.0) {
+    float z0 = viewDist(vUv), r0 = coc(z0), R = maxBlur * pxScale, wsum = 1.0;
+    for (int i = 0; i < 48; i++) {
+      float f = (float(i) + 0.5) / 48.0, a = float(i) * 2.39996323;
+      vec2 o = vec2(cos(a), sin(a)) * sqrt(f) * R;
+      float d = length(o);
+      vec2 uv = vUv + o / res;
+      float zs = viewDist(uv), rs = coc(zs);
+      // nearer samples spread over sharper ones behind them; farther ones never leak forward
+      float w = smoothstep(d - 1.0, d + 1.0, zs < z0 ? rs : min(rs, r0));
+      col += texture2D(tColor, uv) * w; wsum += w;
+    }
+    col /= wsum;
+  }
+  gl_FragColor = col;
+}`;
+
+// Sub-frames of the shutter are summed here, each with its weight.
+const ADD_FRAG = 'uniform sampler2D tColor; uniform float weight; varying vec2 vUv; void main() { gl_FragColor = texture2D(tColor, vUv) * weight; }';
+
+// Bloom, dual-filter mip chain at half resolution. The first downsample keeps only what is brighter
+// than the threshold (soft knee) in linear HDR, so only emissive parts and hot highlights glow.
+const DOWN_FRAG = `
+uniform sampler2D tColor; uniform vec2 texel; uniform float threshold, knee;
+varying vec2 vUv;
+void main() {
+  vec4 c = texture2D(tColor, vUv) * 4.0;
+  c += texture2D(tColor, vUv + texel * vec2(-1.0, -1.0)) + texture2D(tColor, vUv + texel * vec2(1.0, -1.0));
+  c += texture2D(tColor, vUv + texel * vec2(-1.0, 1.0)) + texture2D(tColor, vUv + texel * vec2(1.0, 1.0));
+  c /= 8.0;
+  if (threshold >= 0.0) {
+    float br = max(c.r, max(c.g, c.b)), rq = clamp(br - threshold + knee, 0.0, 2.0 * knee);
+    rq = rq * rq / (4.0 * knee + 1e-4);
+    c = vec4(c.rgb * max(rq, br - threshold) / max(br, 1e-4), 0.0);
+  }
+  gl_FragColor = vec4(c.rgb, 1.0);
+}`;
+
+const UP_FRAG = `
+uniform sampler2D tColor; uniform vec2 texel; uniform float radius;
+varying vec2 vUv;
+void main() {
+  vec2 o = texel * radius;
+  vec3 c = texture2D(tColor, vUv).rgb * 4.0;
+  c += (texture2D(tColor, vUv + vec2(-o.x, 0.0)).rgb + texture2D(tColor, vUv + vec2(o.x, 0.0)).rgb
+      + texture2D(tColor, vUv + vec2(0.0, -o.y)).rgb + texture2D(tColor, vUv + vec2(0.0, o.y)).rgb) * 2.0;
+  c += texture2D(tColor, vUv - o).rgb + texture2D(tColor, vUv + o).rgb
+      + texture2D(tColor, vUv + vec2(-o.x, o.y)).rgb + texture2D(tColor, vUv + vec2(o.x, -o.y)).rgb;
+  gl_FragColor = vec4(c / 16.0, 1.0);
+}`;
+
+// Last pass: bloom added in linear light, lens chromatic aberration (radial, in composition pixels
+// at the corners), tone mapping.
+const OUT_FRAG = `
+uniform sampler2D tColor, tBloom; uniform vec2 res; uniform float ca, pxScale, bloom;
+varying vec2 vUv;
+void main() {
+  vec4 col = texture2D(tColor, vUv);
+  if (ca > 0.0) {
+    vec2 d = (vUv - 0.5) * 2.0 * ca * pxScale / res * 0.7071;
+    vec4 r = texture2D(tColor, vUv + d), b = texture2D(tColor, vUv - d);
+    col = vec4(r.r, col.g, b.b, (r.a + col.a + b.a) / 3.0);
+  }
+  if (bloom > 0.0) {
+    vec3 g = texture2D(tBloom, vUv).rgb * bloom;
+    col = vec4(col.rgb + g, min(1.0, col.a + dot(g, vec3(0.2126, 0.7152, 0.0722))));
+  }
+  gl_FragColor = vec4(col.a > 0.0 ? col.rgb / col.a : vec3(0.0), col.a);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+  gl_FragColor.rgb *= gl_FragColor.a;
+}`;
+
+function makePost(L) {
+  const R = L.renderer, s = L.s;
+  const fx = { enabled: true, ao: { enabled: true, radius: 0.5, intensity: 1.2, bias: 0.03, ground: 1 },
+    dof: { focus: 10, aperture: 0, maxBlur: 16 }, motion: { samples: 1, shutter: 0.5 }, lens: { ca: 0 }, bloom: { strength: 0, threshold: 1, knee: 0.5, radius: 1 },
+    accum: { samples: 1, aa: 1, aperture: 0, focus: null } };
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2));
+  const qScene = new THREE.Scene(); qScene.add(quad);
+  const qCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const mat = (frag, uniforms, toneMapped = false, blending = THREE.NoBlending) => new THREE.ShaderMaterial({
+    vertexShader: FSQ_VERT, fragmentShader: frag, uniforms, depthTest: false, depthWrite: false, toneMapped, blending });
+  const u = (v) => ({ value: v });
+  const res = new THREE.Vector2();
+  const aoMat = mat(AO_FRAG, { tDepth: u(null), invProj: u(new THREE.Matrix4()), res: u(res), radius: u(0), bias: u(0), focal: u(1) });
+  const applyMat = mat(APPLY_FRAG, { tColor: u(null), tAO: u(null), tDepth: u(null), res: u(res), intensity: u(1), ground: u(1), near: u(0.1), far: u(100) });
+  const dofMat = mat(DOF_FRAG, { tColor: u(null), tDepth: u(null), res: u(res), focus: u(10), aperture: u(0), maxBlur: u(0), pxScale: u(1), near: u(0.1), far: u(100) });
+  // premultiplied colours add as they are: ONE, ONE
+  const addMat = Object.assign(mat(ADD_FRAG, { tColor: u(null), weight: u(1) }, false, THREE.CustomBlending),
+    { blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor, blendEquation: THREE.AddEquation });
+  const outMat = mat(OUT_FRAG, { tColor: u(null), tBloom: u(null), res: u(res), ca: u(0), pxScale: u(1), bloom: u(0) }, true);
+  const downMat = mat(DOWN_FRAG, { tColor: u(null), texel: u(new THREE.Vector2()), threshold: u(1), knee: u(0.5) });
+  const upMat = Object.assign(mat(UP_FRAG, { tColor: u(null), texel: u(new THREE.Vector2()), radius: u(1) }, false, THREE.CustomBlending),
+    { blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor, blendEquation: THREE.AddEquation });
+  let rtScene = null, rtAO = null, rtLit = null, rtDof = null, rtAcc = null, mips = [];
+  const target = (w, h, depth, samples = 0, type = depth ? THREE.HalfFloatType : THREE.UnsignedByteType) => {
+    const t = new THREE.WebGLRenderTarget(w, h, { type, samples });
+    if (depth) { t.depthTexture = new THREE.DepthTexture(w, h); t.depthTexture.type = THREE.FloatType; }
+    return t;
+  };
+  const pass = (m, rt) => { quad.material = m; R.setRenderTarget(rt); R.render(qScene, qCam); };
+  // uniform objects are cached per program: only their values may change
+  const set = (m, o) => { for (const k in o) m.uniforms[k].value = o[k]; };
+  const resize = () => {
+    R.getDrawingBufferSize(res);
+    const w = res.x, h = res.y;
+    if (rtScene && rtScene.width === w && rtScene.height === h) return;
+    [rtScene, rtAO, rtLit, rtDof, rtAcc, ...mips].forEach((t) => t?.dispose());
+    mips = [];
+    for (let i = 1; i <= 6; i++) mips.push(target(Math.max(1, w >> i), Math.max(1, h >> i), false, 0, THREE.HalfFloatType));
+    rtScene = target(w, h, true, 4); rtAO = target(w, h, false);
+    rtLit = target(w, h, false, 0, THREE.HalfFloatType); rtDof = target(w, h, false, 0, THREE.HalfFloatType);
+    rtAcc = target(w, h, false, 0, THREE.HalfFloatType);
+  };
+  // One image of the scene, linear and premultiplied, into rtDof.
+  const shot = (scene, camera) => {
+    R.setRenderTarget(rtScene); R.clear(); R.render(scene, camera);
+    const depth = rtScene.depthTexture, near = camera.near, far = camera.far;
+    let color = rtScene.texture;
+    if (fx.ao.enabled) {
+      set(aoMat, { tDepth: depth, radius: fx.ao.radius, bias: fx.ao.bias, focal: camera.projectionMatrix.elements[5] });
+      aoMat.uniforms.invProj.value.copy(camera.projectionMatrixInverse);
+      pass(aoMat, rtAO);
+      set(applyMat, { tColor: color, tAO: rtAO.texture, tDepth: depth, intensity: fx.ao.intensity, ground: fx.ao.ground, near, far });
+      pass(applyMat, rtLit);
+      color = rtLit.texture;
+    }
+    set(dofMat, { tColor: color, tDepth: depth, focus: fx.dof.focus, aperture: fx.dof.aperture, maxBlur: fx.dof.maxBlur, pxScale: res.y / s.h, near, far });
+    pass(dofMat, rtDof);
+  };
+  const bloom = (tex) => {
+    const b = fx.bloom;
+    let src = tex;
+    for (let i = 0; i < mips.length; i++) {
+      set(downMat, { tColor: src, threshold: i === 0 ? b.threshold : -1, knee: Math.max(1e-3, b.knee) });
+      downMat.uniforms.texel.value.set(1 / src.image.width, 1 / src.image.height);
+      pass(downMat, mips[i]);
+      src = mips[i].texture;
+    }
+    const ac = R.autoClear; R.autoClear = false;
+    for (let i = mips.length - 1; i > 0; i--) {
+      const t = mips[i].texture;
+      set(upMat, { tColor: t, radius: b.radius });
+      upMat.uniforms.texel.value.set(1 / t.image.width, 1 / t.image.height);
+      pass(upMat, mips[i - 1]);
+    }
+    R.autoClear = ac;
+    return mips[0].texture;
+  };
+  const out = (tex) => {
+    const k = fx.bloom.strength > 0 ? fx.bloom.strength : 0;
+    set(outMat, { tColor: tex, tBloom: k ? bloom(tex) : null, bloom: k, ca: fx.lens.ca, pxScale: res.y / s.h });
+    pass(outMat, null);
+  };
+  fx.render = (scene, camera) => { resize(); shot(scene, camera); out(rtDof.texture); };
+  // Motion blur: the shutter stays open `shutter` of a frame, centred on the frame time, and
+  // n sub-frames are rendered (script render() included) and averaged before tone mapping.
+  fx.renderShutter = (step, n) => {
+    resize();
+    const cc = R.getClearColor(new THREE.Color()), ca = R.getClearAlpha();
+    R.setRenderTarget(rtAcc); R.setClearColor(0x000000, 0); R.clear(); R.setClearColor(cc, ca);
+    for (let i = 0; i < n; i++) {
+      step((i + 0.5) / n - 0.5, i);
+      shot(s.scene, s.camera);
+      set(addMat, { tColor: rtDof.texture, weight: 1 / n });
+      const ac = R.autoClear; R.autoClear = false; pass(addMat, rtAcc); R.autoClear = ac;
+    }
+    out(rtAcc.texture);
+  };
+  fx.dispose = () => { [rtScene, rtAO, rtLit, rtDof, rtAcc, ...mips].forEach((t) => t?.dispose()); [aoMat, applyMat, dofMat, addMat, outMat, downMat, upMat].forEach((m) => m.dispose()); quad.geometry.dispose(); };
+  return fx;
+}
+
+// Box with rounded edges and smooth normals (same idea as the RoundedBoxGeometry addon):
+// a box with an odd number of segments whose middle segment stays flat on each axis and
+// whose outer ones bend around a sphere octant of radius r.
+function roundedBox(THREE, w = 1, h = 1, d = 1, r = 0.1, seg = 4) {
+  r = Math.max(1e-4, Math.min(r, w / 2, h / 2, d / 2));
+  const n = 2 * seg + 1, geo = new THREE.BoxGeometry(1, 1, 1, n, n, n);
+  const pos = geo.attributes.position, nor = geo.attributes.normal, half = [w / 2 - r, h / 2 - r, d / 2 - r];
+  const c = new THREE.Vector3(), o = [0, 0, 0];
+  for (let i = 0; i < pos.count; i++) {
+    const v = [pos.getX(i), pos.getY(i), pos.getZ(i)];
+    for (let a = 0; a < 3; a++) {
+      const k = Math.round((v[a] + 0.5) * n);
+      if (k <= seg) { o[a] = -half[a]; c.setComponent(a, -(seg - k) / seg); }
+      else { o[a] = half[a]; c.setComponent(a, (k - seg - 1) / seg); }
+    }
+    c.normalize();
+    pos.setXYZ(i, o[0] + c.x * r, o[1] + c.y * r, o[2] + c.z * r);
+    nor.setXYZ(i, c.x, c.y, c.z);
+  }
+  return geo;
+}
+
+// ---------- Post-processing for three-gpu layers (opt-in with s.post() or s.output) ----------
+// Same settings as makePost, built from the r187 TSL addons. A RenderPipeline renders the chain
+// (scene pass with an emissive MRT -> GTAO, denoised -> depth of field -> bloom of the emissive buffer -> lens
+// aberration), linear and premultiplied, into an HDR target; the shots of the shutter add up in a
+// second one, and a last pipeline tone maps it onto the canvas. s.output (any TSL node) replaces
+// the chain, for TRAA, SSR or a custom composite: shutter and tone mapping still apply.
+
+function makeGpuPost(L) {
+  const R = L.renderer, s = L.s, T = s.THREE, N = s.TSL, A = s.addons;
+  const fx = { enabled: true, ao: { enabled: true, radius: 0.5, intensity: 1.2, thickness: 1, samples: 16, ground: 1 },
+    dof: { enabled: false, focus: 10, range: 5, bokeh: 1 }, motion: { samples: 1, shutter: 0.5 }, lens: { ca: 0 },
+    accum: { samples: 1, aa: 1, aperture: 0, focus: null },
+    bloom: { strength: 0, radius: 0.5, threshold: 0, source: 'emissive' } };
+  const u = { aoPow: N.uniform(1), ground: N.uniform(1), focus: N.uniform(10), range: N.uniform(5), bokeh: N.uniform(1),
+    ca: N.uniform(0), pxScale: N.uniform(1), weight: N.uniform(1) };
+  const target = () => new T.RenderTarget(1, 1, { type: T.HalfFloatType, depthBuffer: false });
+  const rtShot = target(), rtAcc = target();
+  const pipe = new T.RenderPipeline(R);
+  pipe.outputColorTransform = false;
+  // premultiplied shots add up as they are: ONE, ONE
+  const addMat = new T.NodeMaterial();
+  addMat.fragmentNode = N.texture(rtShot.texture, N.screenUV).mul(u.weight);
+  Object.assign(addMat, { blending: T.CustomBlending, blendSrc: T.OneFactor, blendDst: T.OneFactor, blendEquation: T.AddEquation, depthTest: false, depthWrite: false });
+  const addQuad = new T.QuadMesh(addMat);
+  const out = new T.RenderPipeline(R);
+  out.outputColorTransform = false;
+  let sig = null, outSig = null, nodes = [], gtao = null, bloomNode = null;
+  const res = new T.Vector2();
+
+  const chain = () => {
+    nodes.forEach((n) => n.dispose?.());
+    nodes = []; gtao = bloomNode = null;
+    if (s.output) return s.output;
+    const p = N.pass(s.scene, s.camera);
+    nodes.push(p);
+    const b = fx.bloom, glow = b.strength > 0, emissive = glow && b.source !== 'scene';
+    const outs = { output: N.output };
+    if (emissive) outs.emissive = N.vec4(N.emissive, N.output.a);
+    const mrt = N.mrt(outs);
+    // the glow buffer blends like each material (additive particles add up, a sprite's quad stays clear)
+    if (emissive) mrt.setBlendMode('emissive', new T.BlendMode(T.MaterialBlending));
+    p.setMRT(mrt);
+    const color = p.getTextureNode('output'), depth = p.getTextureNode('depth');
+    let col = color;
+    if (fx.ao.enabled) {
+      // normals rebuilt from depth: a normal buffer would take the quads of sprites and particles
+      gtao = A.ao(depth, null, s.camera);
+      const clean = A.denoise(gtao.getTextureNode(), depth, null, s.camera);
+      nodes.push(gtao, clean);
+      const k = clean.r.pow(u.aoPow);
+      // opaque surfaces get darker; transparent ones (shadow-catcher ground) gain black coverage
+      col = N.vec4(color.rgb.mul(k), color.a.add(color.a.oneMinus().mul(k.oneMinus()).mul(u.ground)));
+    }
+    if (fx.dof.enabled) {
+      const d = A.dof(col, p.getViewZNode(), u.focus, u.range, u.bokeh);
+      nodes.push(d);
+      col = d;
+    }
+    if (glow) {
+      bloomNode = A.bloom(emissive ? p.getTextureNode('emissive') : col, b.strength, b.radius, b.threshold);
+      nodes.push(bloomNode);
+      const g = bloomNode.rgb;
+      col = N.vec4(col.rgb.add(g), N.min(1, col.a.add(N.luminance(g))));
+    }
+    if (fx.lens.ca > 0) {
+      // radial, in composition pixels at the corners
+      const tex = N.convertToTexture(col);
+      nodes.push(tex);
+      const d = N.screenUV.sub(0.5).mul(u.ca.mul(2 * 0.7071).mul(u.pxScale)).div(N.screenSize);
+      const r = tex.sample(N.screenUV.add(d)), c = tex.sample(N.screenUV), bl = tex.sample(N.screenUV.sub(d));
+      col = N.vec4(r.r, c.g, bl.b, r.a.add(c.a).add(bl.a).div(3));
+    }
+    return col;
+  };
+
+  const update = () => {
+    R.getDrawingBufferSize(res);
+    if (rtAcc.width !== res.x || rtAcc.height !== res.y) { rtShot.setSize(res.x, res.y); rtAcc.setSize(res.x, res.y); }
+    const k = s.output || JSON.stringify([fx.ao.enabled, fx.bloom.strength > 0, fx.bloom.source, fx.dof.enabled, fx.lens.ca > 0]);
+    if (k !== sig) { sig = k; pipe.outputNode = chain(); pipe.needsUpdate = true; }
+    const ok = `${R.toneMapping}:${R.outputColorSpace}`;
+    if (ok !== outSig) {
+      outSig = ok;
+      // tone mapping on straight colours, premultiplied again for the canvas
+      const acc = N.texture(rtAcc.texture, N.screenUV);
+      const toned = N.renderOutput(N.vec4(acc.rgb.div(N.max(acc.a, 1e-4)), acc.a), R.toneMapping, R.outputColorSpace);
+      out.outputNode = N.vec4(toned.rgb.mul(acc.a), acc.a);
+      out.needsUpdate = true;
+    }
+    if (gtao) { gtao.radius.value = fx.ao.radius; gtao.thickness.value = fx.ao.thickness; gtao.samples.value = fx.ao.samples; }
+    if (bloomNode) { bloomNode.strength.value = fx.bloom.strength; bloomNode.radius.value = fx.bloom.radius; bloomNode.threshold.value = fx.bloom.threshold; }
+    u.aoPow.value = fx.ao.intensity; u.ground.value = fx.ao.ground;
+    u.focus.value = fx.dof.focus; u.range.value = fx.dof.range; u.bokeh.value = fx.dof.bokeh;
+    u.ca.value = fx.lens.ca; u.pxScale.value = res.y / s.h;
+  };
+  const clear = () => {
+    R.setRenderTarget(rtAcc);
+    const cc = R.getClearColor(new T.Color()), ca = R.getClearAlpha();
+    R.setClearColor(0x000000, 0); R.clear(); R.setClearColor(cc, ca);
+  };
+  const shot = (weight) => {
+    R.setRenderTarget(rtShot); pipe.render();
+    u.weight.value = weight;
+    R.setRenderTarget(rtAcc);
+    const ac = R.autoClear; R.autoClear = false; addQuad.render(R); R.autoClear = ac;
+  };
+  const present = () => { R.setRenderTarget(null); out.render(); };
+  fx.render = () => { update(); clear(); shot(1); present(); };
+  // Motion blur, as in makePost: step(k) moves the scene to k of the shutter (-0.5..0.5).
+  fx.renderShutter = (step, n) => {
+    update(); clear();
+    for (let i = 0; i < n; i++) { step((i + 0.5) / n - 0.5, i); shot(1 / n); }
+    present();
+  };
+  fx.dispose = () => { nodes.forEach((n) => n.dispose?.()); [rtShot, rtAcc].forEach((t) => t.dispose()); pipe.dispose(); out.dispose(); addMat.dispose(); };
+  return fx;
+}
+
+// ---------- Layers ----------
+
+function compile(code) {
+  // eslint-disable-next-line no-new-func
+  return new Function('s', `${code}\n;return { setup: typeof setup === 'function' ? setup : null, render: typeof render === 'function' ? render : null };`);
+}
+
+function lineOf(err) {
+  // Chrome: "<anonymous>:L:C" inside "eval at compile (...)"; Firefox: "Function:L:C".
+  const st = err?.stack || '';
+  const m = /<anonymous>:(\d+):\d+/.exec(st) || /Function:(\d+):\d+/.exec(st);
+  return m ? Math.max(1, +m[1] - 2) : null;
+}
+
+function report(id, err) {
+  post({ type: 'error', id, message: String(err?.message || err), line: lineOf(err) });
+}
+
+function dispose(L) {
+  for (const t of L.textures.values()) t.dispose();
+  L.fx?.dispose();
+  if (L.renderer) { L.renderer.dispose(); L.renderer.forceContextLoss?.(); }
+}
+
+// Images listed in layer.assets arrive already decoded (ImageBitmap): ready from the first frame.
+function texture(L, name) {
+  let t = L.textures.get(name);
+  if (t) return t;
+  const b = L.s.assets[name];
+  if (!b) throw new Error(`asset inconnu : ${name} (à déclarer dans layer.assets)`);
+  const c = document.createElement('canvas');
+  c.width = b.width;
+  c.height = b.height;
+  c.getContext('2d').drawImage(b, 0, 0);
+  const R = L.renderer;
+  t = new L.s.THREE.CanvasTexture(c);
+  t.colorSpace = L.s.THREE.SRGBColorSpace;
+  t.anisotropy = R.capabilities ? R.capabilities.getMaxAnisotropy() : R.getMaxAnisotropy();
+  L.textures.set(name, t);
+  return t;
+}
+
+function size(L) {
+  const cw = Math.max(1, Math.round(L.w * scale)), ch = Math.max(1, Math.round(L.h * scale));
+  if (L.renderer) {
+    L.renderer.setPixelRatio(1);
+    L.renderer.setSize(cw, ch, false);
+    L.s.camera.aspect = L.w / L.h;
+    L.s.camera.updateProjectionMatrix();
+  } else {
+    L.canvas.width = cw;
+    L.canvas.height = ch;
+  }
+}
+
+// Fields shared by both 3D layer types.
+function scene3d(L, THREE) {
+  const s = L.s;
+  s.THREE = THREE;
+  s.scene = new THREE.Scene();
+  s.camera = new THREE.PerspectiveCamera(35, L.w / L.h, 0.1, 200);
+  s.camera.position.set(0, 0, 10);
+  s.env = (o) => studioEnv(s, o);
+  s.texture = (name) => texture(L, name);
+  s.roundedBox = (w, h, d, r, seg) => roundedBox(THREE, w, h, d, r, seg);
+}
+
+async function build(def) {
+  const L = { ...def, canvas: document.createElement('canvas'), ok: false, textures: new Map() };
+  const s = { w: def.w, h: def.h, params: {}, sub: SUB0, assets: def.assets || {}, clamp, lerp, map, smooth, fract, rand, noise, ease, range, TAU: Math.PI * 2,
+    log: (...a) => post({ type: 'log', id: def.id, text: a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ') }) };
+  L.s = s;
+  try {
+    if (def.type === 'three') {
+      if (!THREE) throw new Error('Three.js non chargé');
+      L.renderer = s.renderer = new THREE.WebGLRenderer({ canvas: L.canvas, antialias: true, alpha: true, preserveDrawingBuffer: true });
+      s.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      s.renderer.outputColorSpace = THREE.SRGBColorSpace;
+      scene3d(L, THREE);
+      // s.post({ ao: {...}, dof: {...} }) turns post-processing on; settings stay live in s.fx
+      s.post = (o = {}) => postWith(L, makePost, o);
+    } else if (def.type === 'three-gpu') {
+      if (!GPU) throw new Error('Three.js WebGPU non chargé');
+      const T = GPU.THREE;
+      // WebGPU when the browser has it, else three's WebGL 2 backend (or layer.backend = 'webgl')
+      L.renderer = s.renderer = new T.WebGPURenderer({ canvas: L.canvas, antialias: true, alpha: true, forceWebGL: def.backend === 'webgl' });
+      await s.renderer.init();
+      s.renderer.toneMapping = T.ACESFilmicToneMapping;
+      s.renderer.outputColorSpace = T.SRGBColorSpace;
+      s.renderer.setClearColor(0x000000, 0);
+      s.webgpu = !!s.renderer.backend.isWebGPUBackend;
+      if (!s.webgpu && def.backend !== 'webgl') s.log('WebGPU indisponible : rendu par WebGL 2');
+      scene3d(L, T);
+      Object.assign(s, { TSL: GPU.TSL, addons: GPU.addons, output: null });
+      s.post = (o = {}) => postWith(L, makeGpuPost, o);
+    } else {
+      s.ctx = L.canvas.getContext('2d');
+    }
+    size(L);
+    const fns = compile(def.code || '')(s);
+    if (!fns.render) throw new Error('le script doit définir function render(s)');
+    L.fns = fns;
+    L.setupDone = false;
+    L.ok = true;
+  } catch (e) {
+    report(def.id, e);
+  }
+  return L;
+}
+
+function postWith(L, make, o) {
+  L.fx ||= make(L);
+  for (const k of ['ao', 'dof', 'motion', 'lens', 'bloom', 'accum']) if (o[k]) Object.assign(L.fx[k], o[k]);
+  if ('enabled' in o) L.fx.enabled = o.enabled;
+  return (L.s.fx = L.fx);
+}
+
+async function sync({ layers: defs, scale: sc }) {
+  const rescale = sc !== scale;
+  scale = sc;
+  const keep = new Set(defs.map((d) => d.id));
+  for (const [id, L] of layers) if (!keep.has(id)) { dispose(L); layers.delete(id); }
+  for (const d of defs) {
+    const L = layers.get(d.id);
+    if (L && L.code === d.code && L.type === d.type && L.assetSig === d.assetSig && L.backend === d.backend) {
+      if (rescale || L.w !== d.w || L.h !== d.h) { Object.assign(L, { w: d.w, h: d.h }); L.s.w = d.w; L.s.h = d.h; size(L); }
+      continue;
+    }
+    if (L) dispose(L);
+    layers.set(d.id, await build(d));
+  }
+}
+
+// Sub-frames of a still image: the shutter (motion blur) and the accumulation (anti-aliasing by a
+// sub-pixel camera offset, real bokeh by moving the camera over the lens disc and aiming it back at
+// the focus plane, soft shadows by lights the script moves with s.sub). Sub-frame i of n gets a
+// point (u, v) on the unit disc (Vogel spiral) and a pixel offset (jx, jy) in -0.5..0.5 (R2 sequence).
+const SUB0 = Object.freeze({ i: 0, n: 1, u: 0, v: 0, jx: 0, jy: 0 });
+function subSample(i, n) {
+  if (n <= 1) return SUB0;
+  const r = Math.sqrt((i + 0.5) / n), a = i * 2.399963229728653, g = 1.324717957244746;
+  return { i, n, u: r * Math.cos(a), v: r * Math.sin(a), jx: fract(0.5 + (i + 1) / g) - 0.5, jy: fract(0.5 + (i + 1) / (g * g)) - 0.5 };
+}
+function subFrames(fx, time) {
+  const m = fx.motion, a = fx.accum;
+  const nm = m.shutter > 0 ? Math.max(1, Math.round(typeof m.samples === 'function' ? m.samples(time) : m.samples)) : 1;
+  const na = Math.max(1, Math.round(typeof a.samples === 'function' ? a.samples(time) : a.samples));
+  return Math.max(nm, na);
+}
+// Moves the camera for sub-frame `sub` after the script's render; returns a function that puts it back.
+function jitterCamera(s, fx, sub) {
+  const cam = s.camera, A = fx.accum;
+  if (!cam || sub.n <= 1) return () => {};
+  const pos = cam.position.clone(), quat = cam.quaternion.clone();
+  if (A.aperture > 0) {
+    cam.updateMatrixWorld();
+    const e = cam.matrixWorld.elements, f = A.focus ?? fx.dof.focus, ap = A.aperture;
+    const P = [pos.x - e[8] * f, pos.y - e[9] * f, pos.z - e[10] * f];
+    cam.position.set(pos.x + (e[0] * sub.u + e[4] * sub.v) * ap, pos.y + (e[1] * sub.u + e[5] * sub.v) * ap, pos.z + (e[2] * sub.u + e[6] * sub.v) * ap);
+    cam.lookAt(P[0], P[1], P[2]);
+  }
+  if (A.aa > 0 && cam.isPerspectiveCamera) {
+    const w = s.renderer.domElement.width, h = s.renderer.domElement.height;
+    cam.updateProjectionMatrix();
+    const pe = cam.projectionMatrix.elements;
+    pe[8] += (2 * sub.jx * A.aa) / w; pe[9] += (2 * sub.jy * A.aa) / h;
+    cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
+  }
+  return () => { cam.position.copy(pos); cam.quaternion.copy(quat); if (cam.isPerspectiveCamera) cam.updateProjectionMatrix(); };
+}
+// Renders one still image with its sub-frames; at(dt) runs the script's render dt seconds off the frame time.
+function renderSubFrames(L, it, fx, at) {
+  const s = L.s, m = fx.motion, n = subFrames(fx, it.time);
+  let undo = () => {};
+  fx.renderShutter((k, i) => {
+    undo();
+    s.sub = subSample(i, n);
+    at(m.shutter > 0 && subFrames({ motion: m, accum: { samples: 1 } }, it.time) > 1 ? (k * m.shutter) / it.fps : 0);
+    undo = jitterCamera(s, fx, s.sub);
+  }, n);
+  undo();
+  s.sub = SUB0;
+}
+
+// three-gpu: no animation loop, so each image moves the node frame on itself (effect passes
+// update once per frame) and pins TSL `time` and `deltaTime` to the layer's time.
+function renderGpu(L, it) {
+  const s = L.s, R = L.renderer, nf = R._nodes.nodeFrame;
+  const at = (dt) => {
+    s.t = it.t + dt; s.time = it.time + dt;
+    nf.update(); nf.time = s.t; nf.deltaTime = 1 / it.fps;
+    L.fns.render(s);
+  };
+  const fx = L.fx?.enabled || s.output ? postWith(L, makeGpuPost, {}) : null;
+  // sub-frames on still images only (paused, export, thumbnails): playback stays fluid
+  if (fx && it.still !== false && subFrames(fx, it.time) > 1) renderSubFrames(L, it, fx, at);
+  else {
+    at(0);
+    if (fx) fx.render();
+    else R.render(s.scene, s.camera);
+  }
+  s.t = it.t; s.time = it.time;
+}
+
+async function render({ n, items }) {
+  const bitmaps = {};
+  for (const it of items) {
+    const L = layers.get(it.id);
+    if (!L?.ok) continue;
+    const s = L.s;
+    Object.assign(s, { t: it.t, time: it.time, p: it.p, frame: it.frame, fps: it.fps, dur: it.dur, params: it.params || {}, scale });
+    try {
+      if (!L.setupDone) { L.setupDone = true; L.fns.setup?.(s); }
+      if (L.type === 'three-gpu') renderGpu(L, it);
+      else if (L.renderer) {
+        const fx = L.fx?.enabled ? L.fx : null;
+        // sub-frames on still images only (paused, export, thumbnails): playback stays fluid;
+        // samples may be a function of time: many for whips, few for still shots
+        if (fx && it.still !== false && subFrames(fx, it.time) > 1) {
+          renderSubFrames(L, it, fx, (dt) => { s.t = it.t + dt; s.time = it.time + dt; L.fns.render(s); });
+          s.t = it.t; s.time = it.time;
+        } else {
+          L.fns.render(s);
+          if (fx) fx.render(s.scene, s.camera);
+          else L.renderer.render(s.scene, s.camera);
+        }
+      } else {
+        const ctx = s.ctx;
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, L.canvas.width, L.canvas.height);
+        ctx.save();
+        ctx.setTransform(scale, 0, 0, scale, 0, 0);
+        L.fns.render(s);
+        ctx.restore();
+      }
+      bitmaps[it.id] = await createImageBitmap(L.canvas);
+    } catch (e) {
+      report(it.id, e);
+    }
+  }
+  post({ type: 'frame', n, bitmaps }, Object.values(bitmaps));
+}
+
+async function load(src) {
+  const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+  try { return await import(url); } finally { URL.revokeObjectURL(url); }
+}
+
+// Messages are handled one at a time, in order: a frame never runs against half-synced layers.
+// Same fonts as text layers, so canvas scripts can use them; never wait more than 3 s.
+const FONTS = ['700 32px Inter', '400 32px Inter', '700 32px "Space Grotesk"', '400 32px "Instrument Serif"', 'italic 400 32px "Instrument Serif"', '500 32px "JetBrains Mono"', '800 32px "Bricolage Grotesque"'];
+let queue = Promise.race([Promise.all(FONTS.map((f) => document.fonts.load(f).catch(() => {}))), new Promise((r) => setTimeout(r, 3000))]);
+addEventListener('message', (e) => {
+  if (e.source !== parent) return;
+  const m = e.data;
+  queue = queue.then(async () => {
+    if (m.type === 'three' && !THREE) THREE = await load(m.src);
+    else if (m.type === 'three-gpu' && !GPU) GPU = await load(m.src);
+    else if (m.type === 'sync') await sync(m);
+    else if (m.type === 'render') await render(m);
+  }).catch((err) => post({ type: 'error', id: null, message: String(err?.message || err) }));
+});
+post({ type: 'ready' });
+</script>

@@ -1,0 +1,55 @@
+/* Motion Studio shell: the tokens the gallery and dialogs read, on the editor's graphite. */
+:root {
+  --bg: #0d0f13;
+  --surface: #15181e;
+  --surface-2: #1c2028;
+  --line: #262b35;
+  --line-strong: #343a47;
+  --text: #e9e7e2;
+  --text-hi: #ffffff;
+  --muted: #a3a1a8;
+  --faint: #8a8893;
+  --accent: #9a8cff;
+  --accent-2: #b2a7ff;
+  --gold: var(--accent);
+  --gold-hi: var(--accent-2);
+  --gold-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --on-text: #0d0f13;
+  --err: #ff6b6b;
+  --err-text: #ff8f8f;
+  --err-bg: color-mix(in srgb, #ff6b6b 14%, transparent);
+  --sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --serif: "Instrument Serif", Georgia, serif;
+  --display: var(--sans);
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --ease: cubic-bezier(.2, .8, .2, 1);
+  --shadow: 0 12px 40px -12px rgba(0, 0, 0, .6);
+  --tabs-h: 0px;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 var(--sans); -webkit-font-smoothing: antialiased; }
+a { color: inherit; }
+.shell { max-width: 1180px; margin: 0 auto; padding: 24px 16px 64px; }
+.shell h2 { font: 600 13px/1.2 var(--sans); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin: 32px 0 14px; }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px; flex: none;
+  min-height: 42px; padding: 0 16px; border: 1px solid var(--line-strong); border-radius: 10px; background: transparent; color: var(--text);
+  font: 600 13px/1.1 var(--sans); text-decoration: none; white-space: nowrap; cursor: pointer;
+  transition: background .2s, border-color .2s, color .2s, transform .15s var(--ease);
+}
+.btn:hover { background: var(--gold-soft); border-color: var(--accent); }
+.btn:active { transform: scale(.97); }
+.btn svg { width: 16px; height: 16px; }
+.btn.sm { min-height: 32px; padding: 0 10px; font-size: 12px; }
+.btn.primary, .btn.pri { background: var(--accent); color: var(--on-text); border-color: var(--accent); }
+.btn.primary:hover, .btn.pri:hover { background: var(--accent-2); border-color: var(--accent-2); }
+.btn.danger { color: var(--err-text); border-color: color-mix(in srgb, var(--err) 50%, transparent); }
+.btn[disabled] { opacity: .45; cursor: default; }
+.empty { color: var(--muted); text-align: center; padding: 34px 16px; border: 1px dashed var(--line-strong); border-radius: 12px; font-size: 14px; }
+.toast {
+  position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom)); transform: translateX(-50%);
+  background: var(--surface); color: var(--text-hi); border: 1px solid var(--accent); border-radius: 10px;
+  padding: 10px 16px; font-size: 14px; font-weight: 500; z-index: 1000; max-width: calc(100% - 32px); box-shadow: var(--shadow);
+}
+.toast[hidden] { display: none; }
